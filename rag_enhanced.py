@@ -34,15 +34,22 @@ class EnhancedRagService(object):
             embedding=DashScopeEmbeddings(model=config.embedding_model_name)
         )
 
+        # 设置默认检索器(确保始终有retriever属性)
+        self.retriever = self.vector_service.get_retriever()
+
         # 初始化缓存
         if self.use_cache:
-            self.cache = ResponseCache(cache_file="./response_cache.json", ttl_hours=24)
+            self.cache = ResponseCache(cache_file=config.cache_file, ttl_hours=24)
             print("[初始化] 响应缓存已启用")
 
         # 初始化混合检索器
         if self.use_hybrid_retrieval:
-            self._init_hybrid_retriever()
-            print("[初始化] 混合检索已启用")
+            try:
+                self._init_hybrid_retriever()
+                print("[初始化] 混合检索已启用")
+            except Exception as e:
+                print(f"[警告] 混合检索初始化失败: {e}")
+                self.retriever = self.vector_service.get_retriever()
 
         # 初始化Prompt模板
         self.prompt_template = ChatPromptTemplate.from_messages(
@@ -63,40 +70,36 @@ class EnhancedRagService(object):
 
     def _init_hybrid_retriever(self):
         """初始化混合检索器"""
-        try:
-            # 从向量库获取所有文档用于BM25索引
-            vector_store = self.vector_service.vector_store
-            all_docs = vector_store.get()
+        # 从向量库获取所有文档用于BM25索引
+        vector_store = self.vector_service.vector_store
+        all_docs = vector_store.get()
 
-            if all_docs and 'documents' in all_docs:
-                # 构建BM25检索器
-                bm25_retriever = BM25Retriever(k1=1.5, b=0.75)
-                documents = [
-                    Document(page_content=doc, metadata=all_docs['metadatas'][i])
-                    for i, doc in enumerate(all_docs['documents'])
-                ]
-                bm25_retriever.add_documents(documents)
+        if all_docs and 'documents' in all_docs:
+            # 构建BM25检索器
+            bm25_retriever = BM25Retriever(k1=1.5, b=0.75)
+            documents = [
+                Document(page_content=doc, metadata=all_docs['metadatas'][i])
+                for i, doc in enumerate(all_docs['documents'])
+            ]
+            bm25_retriever.add_documents(documents)
 
-                # 创建混合检索器
-                vector_retriever = self.vector_service.get_retriever()
-                self.retriever = HybridRetriever(
-                    vector_retriever=vector_retriever,
-                    bm25_retriever=bm25_retriever,
-                    weights=(0.7, 0.3)  # 向量70%, BM25 30%
-                )
-                print(f"[初始化] BM25索引已构建,共{len(documents)}个文档")
-            else:
-                print("[警告] 向量库为空,使用纯向量检索")
-                self.retriever = self.vector_service.get_retriever()
-        except Exception as e:
-            print(f"[警告] 混合检索初始化失败: {e},使用纯向量检索")
-            self.retriever = self.vector_service.get_retriever()
+            # 创建混合检索器
+            vector_retriever = self.vector_service.get_retriever()
+            self.retriever = HybridRetriever(
+                vector_retriever=vector_retriever,
+                bm25_retriever=bm25_retriever,
+                weights=(0.7, 0.3)
+            )
+            print(f"[初始化] BM25索引已构建,共{len(documents)}个文档")
+        else:
+            print("[警告] 向量库为空,使用纯向量检索")
+            # self.retriever 已经在__init__中设置了
 
     def __get_chain(self):
         """获取最终的执行链"""
-        retriever = self.retriever if self.use_hybrid_retrieval else self.vector_service.get_retriever()
+        retriever = self.retriever
 
-        def format_document(docs: list[Document]):
+        def format_document(docs):
             """格式化检索结果"""
             if not docs:
                 return "无相关参考资料"
@@ -108,24 +111,19 @@ class EnhancedRagService(object):
 
             return formatted_str
 
-        def format_for_retriever(value: dict) -> str:
-            """提取查询文本"""
-            return value["input"]
-
-        def format_for_prompt_template(value):
-            """格式化prompt输入"""
-            new_value = {}
-            new_value["input"] = value["input"]["input"]
-            new_value["context"] = value["context"]
-            new_value["history"] = value["input"]["history"]
-            return new_value
-
         # 构建基础链
+        # 用 RunnableLambda 包装自定义 retriever，兼容新版本 LangChain 的管道语法
+        wrapped_retriever = RunnableLambda(lambda q: retriever.invoke(q))
+
         chain = (
             {
                 "input": RunnablePassthrough(),
-                "context": RunnableLambda(format_for_retriever) | retriever | format_document
-            } | RunnableLambda(format_for_prompt_template) | self.prompt_template | print_prompt | self.chat_model | StrOutputParser()
+                "context": RunnableLambda(lambda x: x["input"]) | wrapped_retriever | RunnableLambda(format_document)
+            } | RunnableLambda(lambda x: {
+                "input": x["input"]["input"],
+                "context": x["context"],
+                "history": x["input"]["history"]
+            }) | self.prompt_template | RunnableLambda(print_prompt) | self.chat_model | StrOutputParser()
         )
 
         # 如果启用缓存,包装缓存层
@@ -179,33 +177,3 @@ class EnhancedRagService(object):
 
 # 保持向后兼容,原来的RagService指向增强版
 RagService = EnhancedRagService
-
-
-if __name__ == '__main__':
-    # session id 配置
-    session_config = {
-        "configurable": {
-            "session_id": "user_001",
-        }
-    }
-
-    print("=" * 50)
-    print("测试增强版RAG服务")
-    print("=" * 50)
-
-    # 创建服务实例
-    service = RagService(use_cache=True, use_hybrid_retrieval=True)
-
-    # 测试第一次调用(缓存未命中)
-    print("\n[测试1] 第一次调用(应缓存未命中)")
-    res1 = service.chain.invoke({"input": "针织毛衣如何保养？"}, session_config)
-    print(f"响应: {res1[:100]}...\n")
-
-    # 测试第二次调用(应缓存命中)
-    print("[测试2] 第二次调用相同问题(应缓存命中)")
-    res2 = service.chain.invoke({"input": "针织毛衣如何保养？"}, session_config)
-    print(f"响应: {res2[:100]}...\n")
-
-    # 打印缓存统计
-    stats = service.get_cache_stats()
-    print(f"缓存统计: {stats}")

@@ -9,7 +9,9 @@ import contextvars
 import queue
 import threading
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from langchain_community.chat_models.tongyi import ChatTongyi
@@ -144,6 +146,7 @@ class EnhancedRagService:
     def __init__(self, use_cache: bool = True, use_hybrid_retrieval: bool = True) -> None:
         self.use_cache = use_cache
         self.use_hybrid_retrieval = use_hybrid_retrieval
+        self._retrieval_executor = ThreadPoolExecutor(max_workers=8)
         self.vector_service = VectorStoreService(embedding=DashScopeEmbeddings(model=config.embedding_model_name))
         self.retriever = self.vector_service.get_retriever()
         self.reranker = KeywordReranker()
@@ -361,10 +364,24 @@ class EnhancedRagService:
         return queries
 
     def retrieve_documents(self, query: str) -> list[RetrievalResult]:
-        """Retrieve, fuse, deduplicate, and rerank documents."""
+        """Retrieve, fuse, deduplicate, and rerank documents.
+
+        Sub-queries from expand_queries are dispatched in parallel via a
+        shared ThreadPoolExecutor. RRF fusion is order-independent (it only
+        accumulates scores per doc_id), so parallel execution preserves
+        retrieval semantics. Fail-fast: any sub-query error aborts the whole
+        retrieval, matching prior serial behavior.
+        """
+        sub_queries = self.expand_queries(query)
+        results_list = list(
+            self._retrieval_executor.map(
+                partial(self._retrieve_once, k=config.retrieval_candidate_k),
+                sub_queries,
+            )
+        )
+
         merged: dict[str, RetrievalResult] = {}
-        for sub_query in self.expand_queries(query):
-            results = self._retrieve_once(sub_query, k=config.retrieval_candidate_k)
+        for results in results_list:
             for result in results:
                 doc_id = self._doc_id(result.document)
                 existing = merged.get(doc_id)

@@ -1,6 +1,7 @@
 import json
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -96,7 +97,9 @@ async def chat(request: ChatRequest):
 
 
 @app.post("/api/upload", response_model=BatchUploadResponse)
-async def upload_knowledge(files: list[UploadFile] = File(...)):
+async def upload_knowledge(
+    files: Annotated[list[UploadFile], File(description="知识库文件")],
+):
     """
     上传知识库文件（支持多类型、多文件）
 
@@ -169,7 +172,9 @@ async def upload_knowledge(files: list[UploadFile] = File(...)):
 
 
 @app.post("/api/upload/single")
-async def upload_single_file(file: UploadFile = File(...)):
+async def upload_single_file(
+    file: Annotated[UploadFile, File(description="知识库文件")],
+):
     """
     上传单个知识库文件（简化接口）
 
@@ -197,7 +202,7 @@ async def upload_single_file(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"上传失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"上传失败: {str(e)}") from e
 
 
 @app.get("/api/stats")

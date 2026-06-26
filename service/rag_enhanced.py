@@ -5,6 +5,10 @@ retrieval, lightweight rerank, source citation, and version-aware caching.
 
 from __future__ import annotations
 
+import contextvars
+import queue
+import threading
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,7 +18,7 @@ from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableLambda, RunnableWithMessageHistory
+from langchain_core.runnables import Runnable, RunnableLambda, RunnableWithMessageHistory
 from loguru import logger
 
 from cache.cache_compat import ResponseCacheRedis as ResponseCache
@@ -24,6 +28,16 @@ from retrieval.hybrid_retriever import BM25Retriever, HybridRetriever, Retrieval
 from retrieval.vector_stores import VectorStoreService
 from service.knowledge_version import get_kb_version
 from service.mysql_history_store import get_history
+
+# Per-request status/meta callbacks for streaming observability.
+# Default None: ask()/invoke() path is unaffected. Stream consumers
+# (FastAPI ask_stream, Streamlit UI) set these via contextvars.
+_status_cb: contextvars.ContextVar[Callable[[str], None] | None] = contextvars.ContextVar(
+    "rag_status_cb", default=None
+)
+_meta_cb: contextvars.ContextVar[Callable[[dict[str, Any]], None] | None] = contextvars.ContextVar(
+    "rag_meta_cb", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -65,6 +79,63 @@ class KeywordReranker:
                 )
             )
         return sorted(rescored, key=lambda item: item.score, reverse=True)[:top_k]
+
+
+class CachedRunnable(Runnable):
+    """Runnable wrapper caching invoke/stream results.
+
+    Cache hit on invoke returns stored string; cache hit on stream yields
+    stored string as a single chunk. Cache miss streams the base chain,
+    accumulates chunks, and writes the full response to cache on completion.
+    """
+
+    def __init__(
+        self,
+        base_chain: Runnable,
+        cache: ResponseCache,
+        cache_key_fn: Callable[[str, str], str],
+    ) -> None:
+        super().__init__()
+        self._base_chain = base_chain
+        self._cache = cache
+        self._cache_key_fn = cache_key_fn
+
+    def _resolve_key(
+        self, input_dict: dict[str, Any], config_arg: dict[str, Any] | None
+    ) -> str:
+        question = input_dict.get("input", "")
+        session_id = "default_user"
+        if config_arg:
+            session_id = config_arg.get("configurable", {}).get("session_id", session_id)
+        return self._cache_key_fn(question, session_id)
+
+    def invoke(
+        self, input: dict[str, Any], config: dict[str, Any] | None = None, **kwargs: Any
+    ) -> str:
+        key = self._resolve_key(input, config)
+        cached = self._cache.get(key)
+        if cached:
+            return cached
+        response = self._base_chain.invoke(input, config)
+        self._cache.set(key, response)
+        return response
+
+    def stream(
+        self,
+        input: dict[str, Any],
+        config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        key = self._resolve_key(input, config)
+        cached = self._cache.get(key)
+        if cached:
+            yield cached
+            return
+        chunks: list[str] = []
+        for chunk in self._base_chain.stream(input, config):
+            chunks.append(chunk)
+            yield chunk
+        self._cache.set(key, "".join(chunks))
 
 
 class EnhancedRagService:
@@ -137,8 +208,29 @@ class EnhancedRagService:
         def build_payload(input_dict: dict[str, Any]) -> dict[str, Any]:
             question = input_dict["input"]
             history = input_dict.get("history", [])
+
+            status_cb = _status_cb.get()
+            if status_cb:
+                status_cb("改写问题中")
             rewritten_query = self.rewrite_query(question, history)
+
+            if status_cb:
+                status_cb("检索知识库中")
             docs = self.retrieve_documents(rewritten_query)
+
+            meta_cb = _meta_cb.get()
+            if meta_cb:
+                meta_cb(
+                    {
+                        "rewritten_query": rewritten_query,
+                        "kb_version": get_kb_version(),
+                        "sources": [citation.__dict__ for citation in self.build_sources(docs)],
+                    }
+                )
+
+            if status_cb:
+                status_cb("生成回答中")
+
             return {
                 "input": question,
                 "context": self.format_documents(docs),
@@ -147,7 +239,7 @@ class EnhancedRagService:
 
         chain = RunnableLambda(build_payload) | self.prompt_template | self.chat_model | StrOutputParser()
         if self.use_cache:
-            chain = self._wrap_with_cache(chain)
+            chain = CachedRunnable(chain, self.cache, self._cache_key)
 
         return RunnableWithMessageHistory(
             chain,
@@ -170,6 +262,51 @@ class EnhancedRagService:
             "kb_version": get_kb_version(),
             "sources": [citation.__dict__ for citation in self.build_sources(docs)],
         }
+
+    def ask_stream(
+        self, question: str, session_id: str = "default_user"
+    ) -> Iterator[tuple[str, Any]]:
+        """Stream answer with status/meta events for SSE clients.
+
+        Yields (event_type, payload) tuples in order:
+        status -> meta (cache miss only) -> token... -> done.
+        Uses a worker thread to run chain.stream while bridging contextvar
+        callbacks into an event queue consumed by the caller.
+        """
+        event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+        def on_status(msg: str) -> None:
+            event_queue.put(("status", msg))
+
+        def on_meta(meta: dict[str, Any]) -> None:
+            event_queue.put(("meta", meta))
+
+        ctx = contextvars.copy_context()
+        ctx.run(_status_cb.set, on_status)
+        ctx.run(_meta_cb.set, on_meta)
+
+        cfg = {"configurable": {"session_id": session_id}}
+
+        def worker() -> None:
+            def run() -> None:
+                try:
+                    for chunk in self.chain.stream({"input": question}, cfg):
+                        event_queue.put(("token", chunk))
+                except Exception as exc:
+                    logger.error("ask_stream worker error", exc_info=True)
+                    event_queue.put(("error", str(exc)))
+                finally:
+                    event_queue.put(("done", None))
+
+            ctx.run(run)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            event_type, payload = event_queue.get()
+            yield event_type, payload
+            if event_type == "done":
+                return
 
     def rewrite_query(self, question: str, history: list[BaseMessage] | None = None) -> str:
         """Rewrite follow-up questions into standalone retrieval queries."""
@@ -300,30 +437,12 @@ class EnhancedRagService:
             )
         return sources
 
-    def _wrap_with_cache(self, base_chain):
-        def cached_invoke(input_dict: dict[str, Any], config_arg: dict[str, Any] | None = None):
-            question = input_dict.get("input", "")
-            session_id = "default_user"
-            if config_arg:
-                session_id = config_arg.get("configurable", {}).get("session_id", session_id)
-            cache_key = self._cache_key(question, session_id)
-
-            cached_response = self.cache.get(cache_key)
-            if cached_response:
-                return cached_response
-
-            response = base_chain.invoke(input_dict, config_arg)
-            self.cache.set(cache_key, response)
-            return response
-
-        return RunnableLambda(cached_invoke)
-
     def _cache_key(self, question: str, session_id: str) -> str:
         return "|".join(
             [
                 f"kb:{get_kb_version()}",
                 f"model:{config.chat_model_name}",
-                f"prompt:v2",
+                "prompt:v2",
                 f"session:{session_id}",
                 f"q:{question}",
             ]

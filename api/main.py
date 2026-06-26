@@ -1,10 +1,11 @@
+import json
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from config import config_data as config
 from service.knowledge_base import KnowledgeBaseService
@@ -15,22 +16,6 @@ from service.rag_enhanced import EnhancedRagService
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default_user"
-
-
-class SourceItem(BaseModel):
-    source: str
-    preview: str
-    score: float
-    rank: int
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class ChatResponse(BaseModel):
-    answer: str
-    source: str = "unknown"
-    rewritten_query: str = ""
-    kb_version: int = 1
-    sources: list[SourceItem] = Field(default_factory=list)
 
 
 class UploadResult(BaseModel):
@@ -86,14 +71,28 @@ async def health_check():
     return {"status": "healthy", "service": "rag-api", "kb_version": get_kb_version()}
 
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat")
 async def chat(request: ChatRequest):
+    """SSE 流式问答端点。
+
+    事件协议:
+    - event: status   data: "改写问题中" / "检索知识库中" / "生成回答中"
+    - event: meta     data: {rewritten_query, kb_version, sources} (仅缓存未命中)
+    - event: token    data: "token文本" (缓存命中时为整段一块)
+    - event: error    data: "错误信息"
+    - event: done     data: null
+    """
     if not rag_service:
         raise HTTPException(status_code=500, detail="服务未初始化")
-    try:
-        return rag_service.ask(request.message, session_id=request.session_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"处理请求时出错: {str(e)}")
+
+    def sse_generator() -> Iterator[str]:
+        for event_type, payload in rag_service.ask_stream(
+            request.message, session_id=request.session_id
+        ):
+            data = json.dumps(payload, ensure_ascii=False)
+            yield f"event: {event_type}\ndata: {data}\n\n"
+
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 
 @app.post("/api/upload", response_model=BatchUploadResponse)

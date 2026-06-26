@@ -10,7 +10,7 @@ if _project_root not in sys.path:
 import streamlit as st
 
 from config import config_data as config
-from service.rag_enhanced import EnhancedRagService
+from service.rag_enhanced import EnhancedRagService, _status_cb
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -72,11 +72,13 @@ if prompt:
 
     # AI response
     with st.chat_message("assistant"):
+        status_box = st.status("思考中...", expanded=True)
         ai_res_list = []
         start_time = time.time()
 
         try:
             rag = st.session_state["rag"]
+            _status_cb.set(lambda s: status_box.update(label=s))
             res_stream = rag.chain.stream({"input": prompt}, config.session_config)
 
             def capture(generator, cache_list):
@@ -85,10 +87,14 @@ if prompt:
                     yield chunk
 
             response = st.write_stream(capture(res_stream, ai_res_list))
+            _status_cb.set(None)
             elapsed = time.time() - start_time
+            status_box.update(label="完成", state="complete")
             st.caption(f"⚡ 响应时间: {elapsed:.2f}秒")
 
         except Exception as e:
+            _status_cb.set(None)
+            status_box.update(label="错误", state="error")
             st.error(f"❌ 发生错误: {str(e)}")
             ai_res_list = [f"抱歉，处理您的问题时遇到错误: {str(e)}"]
 

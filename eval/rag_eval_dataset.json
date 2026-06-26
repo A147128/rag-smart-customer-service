@@ -1,0 +1,14 @@
+﻿[
+  {
+    "query": "如何选择衣服颜色",
+    "expected_sources": ["颜色选择.txt"]
+  },
+  {
+    "query": "衣服怎么洗涤养护",
+    "expected_sources": ["洗涤养护.txt"]
+  },
+  {
+    "query": "体重180斤怎么选尺码",
+    "expected_sources": ["尺码推荐.txt"]
+  }
+]
